@@ -3,6 +3,7 @@ import re
 import time
 import json
 import stat
+import sys
 import shutil
 import socket
 import sqlite3
@@ -28,6 +29,7 @@ from core.manager_factory import get_manager
 from core.docker_manager import DockerManager
 from core.infra_manager import PortableInfraManager
 from core.paths import projects_dir, data_root
+from core import python_runtime
 
 
 def _rmtree(path: str):
@@ -1167,6 +1169,22 @@ class Gestor:
         detection = row.get("detection") or {}
         compose_file = detection.get("compose_file")
 
+        # Proyectos Python: resolver intérprete/venv/dependencias AHORA (no al
+        # detectar — la PC puede haber cambiado). Si no hay Python, fallar
+        # antes de levantar la BD, con un mensaje que diga cómo arreglarlo.
+        # También si la detección guardada no encontró comando: puede venir de
+        # una versión vieja que no reconocía app/main.py, FastAPI, etc.
+        python_plan = None
+        _saved_start = detection.get("app_start") or {}
+        if (_saved_start.get("type") in ("django", "python")
+                or (not _saved_start.get("cmd") and python_runtime._detect_entry(Path(path), None))):
+            python_plan = python_runtime.plan(name, path, row.get("app_port"))
+            if not python_plan["ok"]:
+                self.append_log(name, f"[orquestador] {python_plan['error']}. {python_plan['fix']}")
+                self._set_status(name, "ERROR")
+                return {"ok": False, "fix": python_plan["fix"],
+                        "error": f"{python_plan['error']}. {python_plan['fix']}".strip(". ")}
+
         # Si no hay compose.yml existente, generarlo desde la plantilla para la BD detectada
         if not is_frontend_only:
             if not compose_file or not os.path.isfile(compose_file):
@@ -1256,6 +1274,10 @@ class Gestor:
 
         # Arrancar el proceso de la aplicación (npm run dev, python manage.py, etc.)
         app_start  = detection.get("app_start") or {}
+        if python_plan:
+            app_start = {**app_start, "cmd": python_plan["cmd"], "label": python_plan["label"],
+                         "cwd": path, "type": app_start.get("type") or
+                         ("django" if python_plan["label"] == "Django" else "python")}
         app_port   = row.get("app_port")
         infra_urls = self._group_infra_urls(row.get("group_name"), name, root_group=row.get("root_group"))
         app_proc   = self._start_app(name, app_start, creds, db_type, app_port, infra_urls,
@@ -1298,6 +1320,13 @@ class Gestor:
                     cmd = f".\\{parts[0]}" + (f" {rest}" if rest else "")
         # Heredar el entorno del sistema y añadir variables de BD
         env = os.environ.copy()
+        if getattr(sys, "frozen", False):
+            # Dentro del .exe (PyInstaller) estas variables apuntan al Python
+            # embebido de la app: si las hereda el python del proyecto, arranca
+            # con la stdlib equivocada y falla de formas raras.
+            for _k in ("PYTHONHOME", "PYTHONPATH", "_MEIPASS2", "_PYI_APPLICATION_HOME_DIR",
+                       "_PYI_ARCHIVE_FILE", "_PYI_PARENT_PROCESS_LEVEL"):
+                env.pop(_k, None)
         if app_port:
             env["PORT"] = str(app_port)
             env["SERVER_PORT"] = str(app_port)  # Spring Boot usa SERVER_PORT

@@ -54,7 +54,14 @@ if (Test-Path $distDir) {
     $swapped = $true
 }
 
-Move-Item -Path (Join-Path $stagingRoot "DB-Detector-Orquestador") -Destination $distDir
+New-Item -ItemType Directory -Force -Path (Split-Path $distDir) | Out-Null
+try {
+    Move-Item -Path (Join-Path $stagingRoot "DB-Detector-Orquestador") -Destination $distDir -ErrorAction Stop
+} catch {
+    Write-Output "No se pudo mover el build a dist: $_"
+    Write-Output "Usa este .exe por ahora: $stagedExe"
+    exit 1
+}
 Remove-Item -Recurse -Force $stagingRoot -ErrorAction SilentlyContinue
 
 Write-Output "Build listo: dist\DB-Detector-Orquestador\DB-Detector-Orquestador.exe"

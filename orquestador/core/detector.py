@@ -821,17 +821,15 @@ class DatabaseDetector:
                 pass
 
         # ── Django ────────────────────────────────────────────────────────────
-        if (root / "manage.py").exists():
-            py = "python3" if os.path.exists("/usr/bin/python3") else "python"
-            return {"type": "django", "label": "Django",
-                    "cmd": f"{py} manage.py runserver", "cwd": str(root)}
-
-        # ── Flask / FastAPI ───────────────────────────────────────────────────
-        for entry in ["app.py", "main.py", "run.py", "wsgi.py", "asgi.py"]:
-            if (root / entry).exists():
-                py = "python3" if os.path.exists("/usr/bin/python3") else "python"
-                return {"type": "python", "label": f"Python ({entry})",
-                        "cmd": f"{py} {entry}", "cwd": str(root)}
+        # ── Python (Django / Flask / FastAPI / script) ────────────────────────
+        # El comando real (venv, pip install, puerto) se arma en cada arranque
+        # con core.python_runtime.plan(); acá solo se detecta y se etiqueta.
+        from core import python_runtime
+        py_entry = python_runtime._detect_entry(root, None)
+        if py_entry:
+            label, run_args = py_entry
+            return {"type": "django" if label == "Django" else "python", "label": label,
+                    "cmd": f"python {run_args}", "cwd": str(root)}
 
         # ── Ruby on Rails ─────────────────────────────────────────────────────
         if (root / "Gemfile").exists():

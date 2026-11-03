@@ -34,14 +34,20 @@ def _relaunch_as_admin():
     # ShellExecuteW con verbo "runas" dispara el UAC una sola vez al abrir la
     # app — a partir de ahí todo (server + ventana) corre ya elevado, sin
     # pedir de nuevo ni abrir ventanas extra.
-    params = " ".join(f'"{a}"' for a in sys.argv)
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    # Devuelve True solo si el relanzamiento elevado arrancó. Si el UAC se
+    # cancela o la cuenta no es admin (ShellExecuteW <= 32), seguimos sin
+    # elevar en vez de cerrar la app sin abrir nada.
+    # En el .exe congelado sys.argv[0] ES el ejecutable: no repetirlo como arg.
+    args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+    params = " ".join(f'"{a}"' for a in args)
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    return rc > 32
 
 
 def main():
-    if _IS_WINDOWS and not _is_admin():
-        _relaunch_as_admin()
-        return
+    if _IS_WINDOWS and not _is_admin() and "--no-elevate" not in sys.argv:
+        if _relaunch_as_admin():
+            return
 
     import webview
     from api.server import app, _ensure_single_instance, set_desktop_window

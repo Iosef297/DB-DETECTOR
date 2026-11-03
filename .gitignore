@@ -19,3 +19,4 @@ venv/
 orquestador/build/
 orquestador/dist/
 orquestador/dist_staging*/
+orquestador/installer_output/
