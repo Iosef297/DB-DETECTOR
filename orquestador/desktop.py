@@ -44,28 +44,64 @@ def _relaunch_as_admin():
     return rc > 32
 
 
+def _log_crash(exc: BaseException) -> Path:
+    import traceback
+    log_path = Path(os.environ.get("TEMP", ".")) / "db-detector-crash.log"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n--- crash ---\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+    except Exception:
+        pass
+    return log_path
+
+
+def _show_startup_error(log_path: Path):
+    msg = (
+        "No se pudo abrir la ventana de la app.\n\n"
+        f"Detalle del error guardado en:\n{log_path}"
+    )
+    try:
+        ctypes.windll.user32.MessageBoxW(None, msg, "DB-Detector — error al iniciar", 0x10)
+    except Exception:
+        pass
+
+
 def main():
     if _IS_WINDOWS and not _is_admin() and "--no-elevate" not in sys.argv:
         if _relaunch_as_admin():
             return
 
-    import webview
-    from api.server import app, _ensure_single_instance, set_desktop_window
+    # OJO: NO forzar PYTHONNET_RUNTIME=coreclr. El Microsoft.Web.WebView2.WinForms.dll
+    # que empaqueta pywebview está compilado para .NET Framework 4.6.2 (netfx),
+    # no para .NET 8. Si se fuerza CoreCLR, ese .dll referencia tipos de
+    # System.Windows.Forms versión 4.0.0.0 (netfx) pero CoreCLR carga la versión
+    # 8.0.0.0 (de Microsoft.WindowsDesktop.App) -> TypeLoadException al cargar
+    # System.Windows.Forms.ContextMenu. pythonnet por default (sin indicar nada)
+    # usa el CLR de .NET Framework que ya trae Windows, que es justo lo que este
+    # .dll necesita.
 
-    _ensure_single_instance(_PORT)
+    try:
+        import webview
+        from api.server import app, _ensure_single_instance, set_desktop_window
 
-    threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=_PORT, debug=False, use_reloader=False),
-        daemon=True,
-    ).start()
+        _ensure_single_instance(_PORT)
 
-    window = webview.create_window(
-        "DB-Detector — Orquestador",
-        f"http://localhost:{_PORT}",
-        width=1360, height=840, min_size=(960, 600),
-    )
-    set_desktop_window(window)
-    webview.start()
+        threading.Thread(
+            target=lambda: app.run(host="127.0.0.1", port=_PORT, debug=False, use_reloader=False),
+            daemon=True,
+        ).start()
+
+        window = webview.create_window(
+            "DB-Detector — Orquestador",
+            f"http://localhost:{_PORT}",
+            width=1360, height=840, min_size=(960, 600),
+        )
+        set_desktop_window(window)
+        webview.start()
+    except Exception as exc:
+        log_path = _log_crash(exc)
+        _show_startup_error(log_path)
 
 
 if __name__ == "__main__":
