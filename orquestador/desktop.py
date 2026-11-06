@@ -67,6 +67,48 @@ def _show_startup_error(log_path: Path):
         pass
 
 
+def _tray_icon_image():
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((4, 4, 60, 60), fill=(37, 99, 235, 255))
+    draw.ellipse((20, 18, 44, 42), fill=(255, 255, 255, 255))
+    draw.rectangle((28, 40, 36, 56), fill=(255, 255, 255, 255))
+    return img
+
+
+def _setup_tray(window):
+    # Minimiza a la bandeja del sistema en vez de cerrar: al tocar la X se
+    # oculta la ventana y el ícono queda en el tray (doble click / "Mostrar"
+    # la recupera). "Salir" del menú sí cierra la app de verdad.
+    import pystray
+
+    state = {"icon": None}
+
+    def restore(icon=None, item=None):
+        window.show()
+
+    def quit_app(icon, item):
+        icon.stop()
+        window.destroy()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Mostrar DB-Detector", restore, default=True),
+        pystray.MenuItem("Salir", quit_app),
+    )
+    icon = pystray.Icon("db-detector", _tray_icon_image(), "DB-Detector — Orquestador", menu)
+    state["icon"] = icon
+
+    def on_closing():
+        # Cancela el cierre real de la ventana: solo se oculta, el server y
+        # el ícono de bandeja siguen vivos.
+        window.hide()
+        return False
+
+    window.events.closing += on_closing
+    threading.Thread(target=icon.run, daemon=True).start()
+
+
 def main():
     if _IS_WINDOWS and not _is_admin() and "--no-elevate" not in sys.argv:
         if _relaunch_as_admin():
@@ -98,6 +140,7 @@ def main():
             width=1360, height=840, min_size=(960, 600),
         )
         set_desktop_window(window)
+        _setup_tray(window)
         webview.start()
     except Exception as exc:
         log_path = _log_crash(exc)

@@ -671,10 +671,16 @@ async function killAllDbProcesses() {
   const procs = state.dbProcesses;
   if (!procs.length) return;
   if (!confirm(`Matar los ${procs.length} procesos listados (java/postgres/mysql/mongo/redis)?\nEsto puede tumbar servicios que tengas corriendo ahora.`)) return;
+  const fails = [];
   for (const p of procs) {
-    await fetchAPI('POST', `/api/system/kill-pid/${p.pid}`);
+    const data = await fetchAPI('POST', `/api/system/kill-pid/${p.pid}`);
+    if (data && data.error) fails.push(`PID ${p.pid} (${p.name}): ${data.error}`);
   }
-  toast('Procesos matados', 'ok', 2000);
+  if (fails.length) {
+    toast(`No se pudieron matar ${fails.length} proceso(s):\n${fails.join('\n')}`, 'error', 6000);
+  } else {
+    toast('Procesos matados', 'ok', 2000);
+  }
   await loadDbProcesses();
   await loadProjects();
 }
@@ -721,9 +727,9 @@ function renderList() {
         <td style="color:var(--text-sec)">${p.framework || '—'}</td>
         <td>${(p.links && p.links.length)
               ? (p.status === 'RUNNING'
-                  ? p.links.map(l => `<a href="${l.url}/" target="_blank" style="color:var(--accent);margin-right:8px;white-space:nowrap">${esc(l.name)}</a>`).join('')
-                  : p.links.map(l => esc(l.name)).join(', '))
-              : (p.app_port ? (p.status === 'RUNNING' ? `<a href="http://localhost:${p.app_port}/" target="_blank" style="color:var(--accent)">:${p.app_port}</a>` : `:${p.app_port}`) : '—')}</td>
+                  ? p.links.map(l => `<a href="${l.url}/" target="_blank" title="${esc(l.name)}" style="color:var(--accent);margin-right:8px;white-space:nowrap">${esc(l.url)}</a>`).join('')
+                  : p.links.map(l => esc(l.url)).join(', '))
+              : (p.app_port ? (p.status === 'RUNNING' ? `<a href="http://localhost:${p.app_port}/" target="_blank" style="color:var(--accent)">http://localhost:${p.app_port}</a>` : `http://localhost:${p.app_port}`) : '—')}</td>
         <td class="col-center" style="font-variant-numeric:tabular-nums">${p.db_port || '—'}</td>
         <td class="col-center"><span class="badge badge-${p.status}">${p.status}</span></td>
         <td class="col-actions">

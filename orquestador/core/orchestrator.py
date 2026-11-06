@@ -461,8 +461,6 @@ class Gestor:
         "manage.py", "requirements.txt", "Gemfile", "artisan", "go.mod", "main.go",
     ]
     _FE_INDICATORS = ["package.json"]
-    _FE_FRAMEWORKS = {"react", "vue", "vite", "angular", "next", "nuxt", "svelte",
-                      "solid", "preact", "astro", "remix", "gatsby"}
     # Carpetas con nombres típicos de subdivisión BE/FE dentro de un mono-repo
     _SPLIT_NAMES   = {"backend", "frontend", "api", "client", "server", "web",
                       "app", "ui", "spa", "service", "services"}
@@ -508,17 +506,12 @@ class Gestor:
         return False
 
     def _has_fe(self, path: str) -> bool:
-        # Un proyecto tiene FE si package.json lista frameworks de frontend
-        pkg = os.path.join(path, "package.json")
-        if not os.path.exists(pkg):
-            return False
-        try:
-            import json as _json
-            data = _json.loads(open(pkg, encoding="utf-8", errors="replace").read())
-            deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
-            return bool(self._FE_FRAMEWORKS & set(deps.keys()))
-        except Exception:
-            return True  # tiene package.json → asumir frontend
+        # Cualquier proyecto con package.json cuenta como frontend (la lista de
+        # frameworks conocidos quedaba corta: no reconocía Angular porque su
+        # dependencia es "@angular/core", no "angular", ni Ember, Lit, Svelte-kit,
+        # vanilla JS con webpack, etc.). Si además tiene indicios de backend, lo
+        # resuelve _has_be/is_fe_only, no esta función.
+        return os.path.exists(os.path.join(path, "package.json"))
 
     # Carpetas que nunca vale la pena bajar a explorar: dependencias instaladas,
     # salidas de build, VCS, caches. Evita recursión larga/lenta y falsos positivos
