@@ -135,6 +135,14 @@ def _ensure_single_instance(port: int):
     pid = _port_owner_pid(port)
     if pid and pid != os.getpid():
         print(f"Ya hay un server escuchando en el puerto {port} (PID {pid}) — cierro este arranque duplicado.")
+        # Si la otra instancia está escondida en la bandeja, traerla al frente:
+        # si no, abrir el .exe "no hace nada" y parece que la app no arranca.
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/desktop/show", method="POST")
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception:
+            pass
         sys.exit(0)
 
 # ── Ruta del SQLite del registro ─────────────────────────────────────────────
@@ -524,6 +532,25 @@ def api_group_restart(group):
     if not result.get("ok") and "error" in result:
         return jsonify(result), 400
     return jsonify(result)
+
+
+@app.route("/api/desktop/show", methods=["POST"])
+def api_desktop_show():
+    """Lo llama un segundo arranque del .exe para traer al frente esta
+    instancia (que puede estar oculta en la bandeja). Solo desde localhost."""
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"ok": False}), 403
+    if _desktop_window is None:
+        return jsonify({"ok": False, "error": "sin ventana"}), 404
+    try:
+        _desktop_window.show()
+        try:
+            _desktop_window.restore()
+        except Exception:
+            pass
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/api/projects/up-all", methods=["POST"])

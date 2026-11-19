@@ -272,7 +272,12 @@ def _process_name(kernel32, handle) -> str:
 # restart del server, etc.) — los únicos que tiene sentido mostrar para que
 # el usuario los mate a mano; el resto de los procesos del sistema no son
 # asunto nuestro.
-_DB_PROCESS_NAMES = ("java.exe", "postgres.exe", "mysqld.exe", "mongod.exe", "redis-server.exe")
+# Procesos que el orquestador puede dejar vivos: BDs, JVMs (Spring, Kafka,
+# Keycloak, Kafbat), frontends JS (React, Angular, Vue, Next... corren en
+# node; Bun/Deno si el proyecto los usa) y el stack de obs.
+_DB_PROCESS_NAMES = ("java.exe", "postgres.exe", "mysqld.exe", "mongod.exe", "redis-server.exe",
+                     "node.exe", "bun.exe", "deno.exe", "prometheus.exe", "loki-windows-amd64.exe",
+                     "promtail-windows-amd64.exe", "grafana.exe", "grafana-server.exe")
 
 
 class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):

@@ -18,6 +18,43 @@ _IS_WINDOWS = platform.system() == "Windows"
 _NATIVE_CONFIG_FILE = ".orq_native.json"
 
 
+
+def _pid_alive(pid: int) -> bool:
+    """¿Existe el proceso `pid`? Sin efectos secundarios en ningún SO.
+
+    OJO: NO usar os.kill(pid, 0) para esto en Windows — ahí os.kill con
+    cualquier señal que no sea CTRL_C/CTRL_BREAK llama a TerminateProcess:
+    en vez de preguntar si vive, MATA el proceso (p.ej. el postgres que
+    estaba atendiendo a la app)."""
+    if not pid or pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            # Acceso denegado => existe (de otro usuario/elevado); otro error => no existe
+            return k32.GetLastError() == 5
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
 def _data_base() -> str:
     # Directorio donde se guardan los datos de BD (pgdata, datos de MySQL, etc.).
     # Se resuelve en cada llamada (no a nivel de módulo) para respetar ORQ_DATA_DIR
@@ -449,10 +486,10 @@ class NativeManager:
                 lines = open(pid_file).readlines()
                 pid          = int(lines[0].strip())
                 running_port = int(lines[3].strip()) if len(lines) > 3 else None
-                # os.kill(pid, 0) NO envía ninguna señal; solo verifica que el proceso existe.
-                # Si lanza ProcessLookupError → el proceso murió pero dejó el PID file (stale).
-                # Si lanza PermissionError → el proceso existe pero es de otro usuario (igual sirve).
-                os.kill(pid, 0)
+                # ¿Sigue vivo el postmaster? (ver _pid_alive: os.kill(pid, 0) en
+                # Windows lo mataría). Si murió y dejó el PID file → stale.
+                if not _pid_alive(pid):
+                    raise ProcessLookupError(pid)
                 if running_port == port:
                     # Ya está vivo en el puerto correcto → nada que hacer salvo crear la BD si falta.
                     if database and database not in ("postgres", "template0", "template1"):
@@ -695,7 +732,8 @@ class NativeManager:
         if os.path.exists(pid_file):
             try:
                 pid = int(open(pid_file).read().strip())
-                os.kill(pid, 0)
+                if not _pid_alive(pid):
+                    raise ProcessLookupError(pid)
                 return {"ok": True}  # ya está corriendo
             except (ProcessLookupError, PermissionError):
                 pass
@@ -744,7 +782,8 @@ class NativeManager:
         if os.path.exists(pid_file):
             try:
                 pid = int(open(pid_file).read().strip())
-                os.kill(pid, 0)
+                if not _pid_alive(pid):
+                    raise ProcessLookupError(pid)
                 return {"ok": True}
             except (ProcessLookupError, PermissionError):
                 pass

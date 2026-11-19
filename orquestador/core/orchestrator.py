@@ -30,6 +30,7 @@ from core.docker_manager import DockerManager
 from core.infra_manager import PortableInfraManager
 from core.paths import projects_dir, data_root
 from core import python_runtime
+from core import port_detect
 
 
 def _rmtree(path: str):
@@ -42,6 +43,7 @@ def _rmtree(path: str):
         except Exception:
             pass
     shutil.rmtree(path, onerror=_onerror)
+
 
 # Puerto estándar de cada motor de BD dentro del contenedor Docker
 _DB_CONTAINER_PORTS = {
@@ -77,6 +79,26 @@ class Gestor:
         self._lock = threading.Lock()
         # Inicializar esquema SQLite si la tabla no existe todavía
         self._init_db()
+        # Estados que quedaron de una sesión anterior (app cerrada a la fuerza,
+        # crash): sin esto la UI muestra RUNNING en proyectos que no corren y
+        # "Iniciar grupo" los salta creyendo que ya están arriba.
+        threading.Thread(target=self._reconcile_statuses, daemon=True).start()
+
+    def _project_alive(self, p: dict) -> bool:
+        port = p.get("app_port")
+        return bool(port) and self._port_is_alive(int(port), timeout=0.5)
+
+    def _reconcile_statuses(self):
+        try:
+            for p in self.list_projects():
+                st = p.get("status")
+                if st in ("RUNNING", "STARTING") and not self._project_alive(p):
+                    self._set_status(p["name"], "STOPPED")
+                elif st == "ERROR" and p.get("role") != "infra" and self._project_alive(p):
+                    # Marcado ERROR por un intento fallido, pero la app responde
+                    self._set_status(p["name"], "RUNNING")
+        except Exception:
+            pass
 
     # ── SQLite setup ──────────────────────────────────────────────────────────
 
@@ -312,45 +334,12 @@ class Gestor:
     # Dónde Spring Boot suele declarar su puerto fijo (típico en servicios de
     # infra tipo Eureka/config server, que casi siempre fijan server.port en
     # vez de dejarlo en el 8080 por defecto).
-    _SPRING_CONFIG_FILES = (
-        "application.yml", "application.yaml", "application.properties",
-        os.path.join("src", "main", "resources", "application.yml"),
-        os.path.join("src", "main", "resources", "application.yaml"),
-        os.path.join("src", "main", "resources", "application.properties"),
-    )
-
-    def _detect_natural_port(self, path: str, framework: str | None) -> int | None:
-        """Puerto que el propio proyecto declara para arrancar (ej. server.port
-        en el application.yml de un servicio Eureka). Solo lo intentamos para
-        frameworks donde ese puerto suele venir fijo en el código fuente —
-        Spring Boot es el caso típico. None si no se puede determinar."""
-        if framework != "springboot":
-            return None
-        import re
-        for rel in self._SPRING_CONFIG_FILES:
-            fpath = os.path.join(path, rel)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                text = open(fpath, encoding="utf-8", errors="replace").read()
-            except Exception:
-                continue
-            # application.properties: server.port=8761 (con o sin ${VAR:default})
-            m = re.search(r'^\s*server\.port\s*=\s*\$\{[^:}]+:(\d+)\}', text, re.MULTILINE)
-            if not m:
-                m = re.search(r'^\s*server\.port\s*=\s*(\d+)\s*$', text, re.MULTILINE)
-            if m:
-                return int(m.group(1))
-            # application.yml: bloque "server:" con "port:" indentado debajo
-            m = re.search(r'^server:[ \t]*\n((?:[ \t]+.*\n?)*)', text, re.MULTILINE)
-            if m:
-                block = m.group(1)
-                pm = re.search(r'port:\s*\$\{[^:}]+:(\d+)\}', block)
-                if not pm:
-                    pm = re.search(r'port:\s*["\']?(\d+)["\']?', block)
-                if pm:
-                    return int(pm.group(1))
-        return None
+    def _detect_natural_port(self, path: str, framework: str | None,
+                             cmd: str | None = None) -> int | None:
+        """Puerto que el propio proyecto declara (application.yml, config-repo
+        del Config Server, .env, package.json, vite.config, código...). Ver
+        core/port_detect.py. None si no se puede determinar."""
+        return port_detect.detect_natural_port(path, framework, cmd)
 
     def _register(self, path: str, name: str | None = None,
                   source: dict | None = None,
@@ -415,7 +404,7 @@ class Gestor:
             # el común de los casos con el que ya trae hardcodeado todo lo que
             # depende de él, y seguimos cayendo al pool genérico si ese puerto ya
             # está ocupado por otra cosa.
-            natural_port = self._detect_natural_port(path, framework)
+            natural_port = self._detect_natural_port(path, framework, app_start.get("cmd"))
             natural_db_port = creds.get("port") if creds else None
             db_port, app_port = self.port_manager.assign_ports(
                 name, natural_app_port=natural_port, natural_db_port=natural_db_port
@@ -723,7 +712,7 @@ class Gestor:
         results = []
         ordered = infra + backends + frontends + others
         for p in ordered:
-            if p.get("status") == "RUNNING":
+            if p.get("status") == "RUNNING" and self._project_alive(p):
                 results.append({"name": p["name"], "ok": True, "already": True})
                 continue
             # Chequeo en vivo durante el arranque del grupo: si entre un
@@ -741,7 +730,16 @@ class Gestor:
                 "name": p["name"], "ok": res.get("ok", False), "error": res.get("error"),
                 "port_conflict": res.get("port_conflict"),
             })
-            if p.get("role") in ("backend", "infra"):
+            if res.get("ok") and res.get("starting") and _infra_rank(p) == 0:
+                # config server / eureka / gateway: los demás los necesitan
+                # arriba al boot — esperar a que respondan de verdad.
+                t0 = time.time()
+                while time.time() - t0 < 180:
+                    st = (self._get_row(p["name"]) or {}).get("status")
+                    if st != "STARTING":
+                        break
+                    time.sleep(1)
+            elif p.get("role") in ("backend", "infra"):
                 # Margen corto para que el backend/infra recién prendido tenga chance
                 # de terminar su boot (conectar a config server, registrarse en
                 # discovery, etc.) antes de prender el siguiente. No es un
@@ -751,11 +749,14 @@ class Gestor:
         urls = []
         for p in ordered:
             updated = self._get_row(p["name"])
-            if updated.get("status") == "RUNNING" and updated.get("app_port"):
+            # STARTING también: el vigilante lo pasa a RUNNING cuando el puerto
+            # responda (un frontend/java recién lanzado casi nunca lo hizo aún).
+            if updated.get("status") in ("RUNNING", "STARTING") and updated.get("app_port"):
                 urls.append({
                     "name": updated["name"],
                     "role": updated.get("role"),
                     "url":  f"http://localhost:{updated['app_port']}",
+                    "starting": updated.get("status") == "STARTING",
                 })
 
         ok = all(r["ok"] for r in results)
@@ -983,11 +984,15 @@ class Gestor:
         """True si algo acepta conexiones TCP en localhost:port ahora mismo.
         Un connect exitoso alcanza — no importa qué responda la app por encima
         (hasta un 404 cuenta: significa que el servidor HTTP ya está arriba)."""
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-                return True
-        except OSError:
-            return False
+        # IPv4 y IPv6: dev servers como `ng serve` o Vite escuchan solo en
+        # [::1] (localhost resuelto a IPv6) y un connect a 127.0.0.1 falla.
+        for host in ("127.0.0.1", "::1"):
+            try:
+                with socket.create_connection((host, port), timeout=timeout):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _port_owner(self, port: int, exclude_name: str | None = None) -> dict | None:
         """Quién tiene agarrado `port`. Primero busca entre nuestros propios
@@ -1101,14 +1106,95 @@ class Gestor:
                          f"(soportados: {', '.join(self.infra.SUPPORTED)}) "
                          f"y Docker no está disponible como fallback"}
 
+    def _resync_natural_port(self, row: dict) -> dict:
+        """Si el proyecto declara su propio puerto (server.port, config-repo,
+        ng serve...) y el registrado es otro — típicamente uno del pool porque
+        al registrarlo no se supo leer, o estaba ocupado — lo corregimos antes
+        de arrancar, siempre que esté libre y ningún otro proyecto lo tenga.
+        Todo lo demás (Keycloak redirects, frontend, rutas del gateway) suele
+        traer ese puerto hardcodeado."""
+        try:
+            start_cmd = ((row.get("detection") or {}).get("app_start") or {}).get("cmd")
+            natural = self._detect_natural_port(row["path"], row.get("framework"), start_cmd)
+        except Exception:
+            return row
+        current = row.get("app_port")
+        if not natural or natural == current:
+            return row
+        con = self._con()
+        taken = con.execute(
+            "SELECT name FROM projects WHERE app_port = ? AND name != ?",
+            (natural, row["name"])).fetchone()
+        if taken or not self.port_manager.is_port_free(natural):
+            con.close()
+            return row
+        con.execute("UPDATE projects SET app_port = ?, updated_at = ? WHERE name = ?",
+                    (natural, self._now(), row["name"]))
+        con.commit()
+        con.close()
+        self.append_log(row["name"], f"[orquestador] Puerto corregido {current} → {natural} "
+                                     f"(el que declara el propio proyecto)")
+        return self._get_row(row["name"])
+
     def up(self, name: str) -> dict:
+        res = self._up_impl(name)
+        # Que el motivo de un fallo quede en el log del proyecto: si no, la UI
+        # muestra ERROR y no hay forma de saber por qué.
+        if isinstance(res, dict) and not res.get("ok") and res.get("error"):
+            self.append_log(name, f"[orquestador] No arrancó: {res['error']}")
+        return res
+
+    # Cuánto esperar a que la app abra su puerto antes de declararla en ERROR.
+    _READY_TIMEOUT = {"springboot": 300}
+    _READY_TIMEOUT_DEFAULT = 180
+
+    def _watch_ready(self, name: str, proc: "subprocess.Popen", port: int, framework: str | None):
+        """STARTING → RUNNING recién cuando el puerto responde de verdad (no
+        apenas se lanzó el proceso). Si el proceso muere antes → ERROR."""
+        timeout = self._READY_TIMEOUT.get(framework or "", self._READY_TIMEOUT_DEFAULT)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self._lock:
+                current = self._procs.get(name)
+            if current is not proc:
+                return  # lo bajaron o lo reiniciaron: este vigilante ya no aplica
+            if self._port_is_alive(port, timeout=0.5):
+                self._set_status(name, "RUNNING")
+                self.append_log(name, f"[orquestador] Listo en http://localhost:{port} "
+                                      f"({int(time.time() - t0)}s)")
+                return
+            if proc.poll() is not None:
+                self._set_status(name, "ERROR")
+                self.append_log(name, f"[orquestador] El proceso terminó (código {proc.returncode}) "
+                                      f"sin abrir el puerto {port}")
+                return
+            time.sleep(1)
+        self._set_status(name, "ERROR")
+        self.append_log(name, f"[orquestador] Sigue sin responder en el puerto {port} tras "
+                              f"{timeout}s (el proceso sigue vivo: revisá el log)")
+
+    def _up_impl(self, name: str) -> dict:
         row = self._get_row(name)
         if not row:
             return {"ok": False, "error": f"Proyecto '{name}' no encontrado"}
         if row.get("role") == "infra":
             return self._up_infra(row)
 
-        # Matar proceso anterior si quedó colgado de un up() previo
+        # ▶ sobre algo que ya está corriendo o arrancando: no tocarlo. Antes se
+        # mataba el proceso (solo el cmd.exe de arriba: la app quedaba huérfana
+        # y sin control) y se volvía a arrancar encima.
+        with self._lock:
+            live = self._procs.get(name)
+        if live and live.poll() is None:
+            port = row.get("app_port")
+            if port and self._port_is_alive(port):
+                self._set_status(name, "RUNNING")
+                return {"ok": True, "already_running": True, "app_url": f"http://localhost:{port}",
+                        "app_port": port, "db_port": row.get("db_port")}
+            return {"ok": True, "starting": True, "app_port": port, "db_port": row.get("db_port"),
+                    "app_url": f"http://localhost:{port}" if port else None}
+
+        # Proceso anterior ya muerto: limpiar la referencia
         with self._lock:
             old_proc = self._procs.pop(name, None)
         if old_proc and old_proc.poll() is None:
@@ -1127,6 +1213,7 @@ class Gestor:
         # críptico de "port already in use" en el propio log de la app. Mejor
         # decir desde ya quién lo tiene — puede ser otro de nuestros proyectos
         # (se puede bajar con un clic) o un proceso suelto del sistema.
+        row = self._resync_natural_port(row)
         app_port_preflight = row.get("app_port")
         if app_port_preflight and not self.port_manager.is_port_free(app_port_preflight):
             # Antes de declarar conflicto: si algo responde de verdad en ese puerto
@@ -1279,10 +1366,19 @@ class Gestor:
             with self._lock:
                 self._procs[name] = app_proc
 
-        self._set_status(name, "RUNNING")
+        starting = bool(app_proc and app_port)
+        if starting:
+            # RUNNING lo pone el vigilante cuando el puerto responda.
+            self._set_status(name, "STARTING")
+            threading.Thread(target=self._watch_ready,
+                             args=(name, app_proc, int(app_port), row.get("framework")),
+                             daemon=True).start()
+        else:
+            self._set_status(name, "RUNNING")
         updated = self._get_row(name)
         return {
             "ok":      True,
+            "starting": starting,
             "app_url": f"http://localhost:{app_port}",
             "app_port": app_port,
             "db_port":  updated.get("db_port"),
@@ -1323,6 +1419,13 @@ class Gestor:
         if app_port:
             env["PORT"] = str(app_port)
             env["SERVER_PORT"] = str(app_port)  # Spring Boot usa SERVER_PORT
+            # Angular CLI / Vite ignoran PORT: sin esto arrancan en su puerto
+            # por defecto y el panel muestra una URL que no responde.
+            script = port_detect.npm_script(cwd, cmd)
+            if (port_detect.js_dev_server_kind(script) and "--port" not in script
+                    and "--port" not in cmd):
+                sep = "" if re.match(r'^\s*yarn\b', cmd) else " --"
+                cmd = f"{cmd}{sep} --port {app_port}"
 
         host = creds.get("host", "localhost")
         if host == "127.0.0.1":
@@ -1511,7 +1614,7 @@ class Gestor:
             return None
         try:
             out = subprocess.run(
-                ["netstat", "-ano"], capture_output=True, text=True, timeout=10
+                ["netstat", "-ano"], capture_output=True, encoding="utf-8", errors="replace", timeout=10
             ).stdout
             for line in out.splitlines():
                 parts = line.split()
@@ -1627,11 +1730,16 @@ class Gestor:
         return {"started": started, "errors": errors}
 
     def down_all(self) -> dict:
-        # Parar solo los proyectos en estado RUNNING o STARTING
+        # Parar todo lo que pueda estar vivo: RUNNING/STARTING, y también ERROR
+        # (un arranque que se pasó del timeout o un 2º intento fallido marcan
+        # ERROR con la app viva — si se salta, queda huérfana al salir) o
+        # cualquiera con proceso propio registrado.
         projects = self.list_projects()
+        with self._lock:
+            tracked = set(self._procs)
         stopped, errors = [], []
         for p in projects:
-            if p.get("status") in ("RUNNING", "STARTING"):
+            if p.get("status") in ("RUNNING", "STARTING", "ERROR") or p["name"] in tracked:
                 result = self.down(p["name"])
                 if result.get("ok"):
                     stopped.append(p["name"])

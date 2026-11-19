@@ -320,6 +320,61 @@ def _read_compose_hints(project_path: str) -> dict:
     return hints
 
 
+def _read_kafka_port(project_path: str):
+    """Puerto host del broker Kafka según el compose. _read_compose_hints
+    prefiere "X:8080" (pensado para Keycloak), que en un compose de Kafka es
+    el de Kafka UI — no sirve acá. Orden: listener EXTERNAL/PLAINTEXT_HOST
+    anunciado en localhost, luego el primer mapeo de puertos cuyo destino no
+    sea 8080."""
+    for cf in ("compose-dev.yml", "compose-dev.yaml",
+               "compose.yml", "compose.yaml",
+               "docker-compose.yml", "docker-compose.yaml"):
+        candidate = os.path.join(project_path, cf)
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            content = open(candidate, encoding="utf-8", errors="ignore").read()
+        except Exception:
+            continue
+        m = re.search(r'ADVERTISED_LISTENERS\s*[:=][^\n]*?://(?:localhost|127\.0\.0\.1):(\d{2,5})', content)
+        if m:
+            return int(m.group(1))
+        for host, container in re.findall(r'["\']?(\d{2,5}):(\d{2,5})["\']?', content):
+            if container != "8080":
+                return int(host)
+        return None
+    return None
+
+
+def _cleanup_kafka_deleted_files(log_dir: str, on_log=None):
+    """Kafka en Windows marca los snapshots (.checkpoint) como read-only y al
+    renombrarlos a *.deleted después no puede borrarlos: en el siguiente
+    arranque recoverSnapshots() intenta deleteIfExists() y muere con
+    AccessDeniedException. Los limpiamos nosotros antes de arrancar (quitando
+    el atributo read-only primero, que os.remove tampoco lo tolera)."""
+    import stat
+    if not os.path.isdir(log_dir):
+        return
+    for root, _dirs, files in os.walk(log_dir):
+        for fname in files:
+            path = os.path.join(root, fname)
+            # Los .checkpoint vigentes también quedan read-only y Kafka borra
+            # los viejos al recuperar snapshots — sin escritura revienta igual.
+            try:
+                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+            if not fname.endswith(".deleted"):
+                continue
+            try:
+                os.remove(path)
+                if on_log:
+                    on_log(f"[orquestador] Kafka: borrado residuo {fname}")
+            except OSError as e:
+                if on_log:
+                    on_log(f"[orquestador] Kafka: no se pudo borrar {fname}: {e}")
+
+
 class PortableInfraManager:
     """Arranca servicios de infra (Kafka, Keycloak) como procesos nativos."""
 
@@ -798,8 +853,7 @@ scrape_configs: []
             return result
         home = result["home"]
 
-        hints = _read_compose_hints(project_path)
-        kafka_port = hints.get("port") or _CATALOG["kafka"]["default_port"]
+        kafka_port = _read_kafka_port(project_path) or _CATALOG["kafka"]["default_port"]
 
         new_procs = []
 
@@ -912,6 +966,9 @@ group.initial.rebalance.delay.ms=0
             if fmt.returncode != 0:
                 return {"ok": False, "error": f"kafka-storage format falló: {fmt.stderr or fmt.stdout}"}
 
+        if _IS_WINDOWS:
+            _cleanup_kafka_deleted_files(log_dir, on_log)
+
         log_file = open(os.path.join(data_dir, "kafka.log"), "ab")
         creationflags = subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0
         if _IS_WINDOWS:
@@ -933,8 +990,9 @@ group.initial.rebalance.delay.ms=0
         if on_log:
             on_log(f"[orquestador] Kafka (KRaft) arrancando en localhost:{port} ...")
         if not _wait_for_port("localhost", port, timeout=60):
-            return {"ok": False, "error": f"Kafka no respondió en el puerto {port} tras 60s"}
-        return {"ok": True, "port": port}
+            return {"ok": False, "pid": proc.pid, "port": port,
+                    "error": f"Kafka no respondió en el puerto {port} tras 60s (ver {data_dir}\\kafka.log)"}
+        return {"ok": True, "port": port, "pid": proc.pid}
 
     # ── Keycloak ─────────────────────────────────────────────────────────────
 

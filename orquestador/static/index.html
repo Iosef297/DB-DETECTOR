@@ -463,7 +463,7 @@ function dbMeta(type) {
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
-const state = { projects: [], selected: null, tab: 'info', queryRows: [], queryPage: 0, collapsedGroups: new Set(), dbProcesses: [], procPanelCollapsed: true };
+const state = { projects: [], selected: null, tab: 'info', queryRows: [], queryPage: 0, collapsedGroups: new Set(), dbProcesses: [], procPanelCollapsed: true, miscGroups: {} };
 
 // ── API ────────────────────────────────────────────────────────────────────
 async function fetchAPI(method, endpoint, body) {
@@ -591,7 +591,15 @@ function renderSidebar() {
     }
   });
 
-  let html = standalone.map(p => sidebarItem(p)).join('');
+  // Sueltos (sin subcarpeta) van juntos bajo un nodo "Miscelaneo".
+  const miscNode = (key, collapseKey, members) => {
+    if (!members.length) return '';
+    state.miscGroups[key] = members.map(p => p.name);
+    return sidebarGroupHeader(collapseKey, 'Miscelaneo', members.length, members, `removeMisc('${escAttr(key)}')`) +
+      (state.collapsedGroups.has(collapseKey) ? '' : sidebarNest(members.map(p => sidebarItem(p)).join('')));
+  };
+
+  let html = miscNode('global', 'misc:global', standalone);
 
   html += Object.entries(flatGroups).map(([name, members]) =>
     sidebarGroupHeader(name, name, members.length, members, `removeGroup('${escAttr(name)}')`) +
@@ -604,7 +612,7 @@ function renderSidebar() {
     const rootCollapsed = state.collapsedGroups.has(rootKey);
     let inner = '';
     if (!rootCollapsed) {
-      inner += rg.direct.map(p => sidebarItem(p)).join('');
+      inner += miscNode('root:' + rootName, 'misc:root:' + rootName, rg.direct);
       inner += Object.entries(rg.subgroups).map(([name, members]) =>
         sidebarGroupHeader(name, name, members.length, members, `removeGroup('${escAttr(name)}')`) +
         (state.collapsedGroups.has(name) ? '' : sidebarNest(members.map(p => sidebarItem(p)).join('')))
@@ -744,7 +752,12 @@ function renderList() {
       </tr>`;
   };
 
-  const groupBlock = (name, members, indent = 0) => {
+  // miscKey: grupo virtual "Miscelaneo" (proyectos sueltos, sin subcarpeta).
+  // No existe en la BD: sus botones actúan proyecto por proyecto.
+  const groupBlock = (name, members, indent = 0, miscKey = null) => {
+    if (miscKey) state.miscGroups[miscKey] = members.map(p => p.name);
+    const k = miscKey ? escAttr(miscKey) : null;
+    const act = (real, virt) => miscKey ? `${virt}('${k}')` : `${real}('${escAttr(name)}')`;
     const be = members.filter(p => p.role === 'backend').length;
     const fe = members.filter(p => p.role === 'frontend').length;
     const infra = members.filter(p => p.role === 'infra').length;
@@ -759,11 +772,11 @@ function renderList() {
             <strong>${esc(name)}</strong>
             <span style="color:var(--muted);font-size:12px">${be} backend · ${fe} frontend${infra ? ` · ${infra} infra` : ''}</span>
             <div class="spacer"></div>
-            ${springMembers.length ? `<button class="btn ${anyLimited ? 'primary' : ''}" title="${anyLimited ? 'Quitar límite de RAM a todo el grupo' : 'Limitar RAM a 512MB en todo el grupo (requiere reiniciar)'}" onclick="toggleGroupRamLimit('${escAttr(name)}', ${anyLimited})"><i class="fa fa-memory"></i></button>` : ''}
-            <button class="btn primary" onclick="startGroup('${escAttr(name)}')"><i class="fa fa-play"></i> Iniciar grupo</button>
-            <button class="btn" onclick="restartGroup('${escAttr(name)}')"><i class="fa fa-rotate-right"></i> Reiniciar grupo</button>
-            <button class="btn" onclick="stopGroup('${escAttr(name)}')"><i class="fa fa-stop"></i> Parar grupo</button>
-            <button class="btn danger" title="Eliminar grupo entero" onclick="removeGroup('${escAttr(name)}')"><i class="fa fa-trash"></i></button>
+            ${springMembers.length && !miscKey ? `<button class="btn ${anyLimited ? 'primary' : ''}" title="${anyLimited ? 'Quitar límite de RAM a todo el grupo' : 'Limitar RAM a 512MB en todo el grupo (requiere reiniciar)'}" onclick="toggleGroupRamLimit('${escAttr(name)}', ${anyLimited})"><i class="fa fa-memory"></i></button>` : ''}
+            <button class="btn primary" onclick="${act('startGroup', 'startMisc')}"><i class="fa fa-play"></i> Iniciar grupo</button>
+            <button class="btn" onclick="${act('restartGroup', 'restartMisc')}"><i class="fa fa-rotate-right"></i> Reiniciar grupo</button>
+            <button class="btn" onclick="${act('stopGroup', 'stopMisc')}"><i class="fa fa-stop"></i> Parar grupo</button>
+            <button class="btn danger" title="Eliminar grupo entero" onclick="${act('removeGroup', 'removeMisc')}"><i class="fa fa-trash"></i></button>
           </div>
         </td>
       </tr>
@@ -794,7 +807,7 @@ function renderList() {
           </div>
         </td>
       </tr>
-      ${direct.map(p => row(p, 1)).join('')}
+      ${direct.length ? groupBlock('Miscelaneo', direct, 1, `root:${rootName}`) : ''}
       ${Object.entries(sub).filter(([name]) => name !== '_')
         .map(([name, members]) => groupBlock(name, members, 1)).join('')}`;
   };
@@ -807,7 +820,7 @@ function renderList() {
         <th>App URL</th><th class="col-center">Puerto DB</th><th class="col-center">Estado</th><th class="col-actions"></th>
       </tr></thead>
       <tbody>
-      ${ungrouped.map(row).join('')}
+      ${ungrouped.length ? groupBlock('Miscelaneo', ungrouped, 0, 'global') : ''}
       ${Object.entries(flatGroups).map(([name, members]) => groupBlock(name, members)).join('')}
       ${Object.entries(rootGroups).map(([name, sub]) => rootBlock(name, sub)).join('')}
       </tbody>
@@ -1047,8 +1060,9 @@ async function projectAction(name, action) {
     await handlePortConflict(data.port_conflict, () => projectAction(name, action));
   } else if (data.error) {
     toast(data.error, 'error');
-  } else if (action === 'up') {
-    toast('Servicio levantado', 'ok', 2500);
+  } else if (action === 'up' || action === 'restart') {
+    toast(data.already_running ? 'Ya estaba corriendo'
+          : data.starting ? 'Arrancando… quedará RUNNING cuando responda' : 'Servicio levantado', 'ok', 3000);
   }
   await loadProjects();
 }
@@ -1236,6 +1250,52 @@ async function confirmAdd() {
   closeModal();
 }
 
+// ── Grupo virtual "Miscelaneo" ────────────────────────────────────────────
+// Proyectos sueltos (sin subcarpeta de grupo) que la lista junta bajo un
+// mismo bloque. No es un grupo de la BD: cada acción va proyecto por proyecto.
+function miscProjects(key) {
+  const names = state.miscGroups[key] || [];
+  const rank = p => (p.detection && p.detection.infra_rank != null) ? p.detection.infra_rank : 9;
+  return state.projects.filter(p => names.includes(p.name))
+    .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+}
+
+async function startMisc(key) {
+  toast(`Levantando 'Miscelaneo'…`, 'ok', 2500);
+  const results = [];
+  for (const p of miscProjects(key)) {
+    const r = await fetchAPI('POST', `/api/projects/${encodeURIComponent(p.name)}/up`);
+    results.push({ name: p.name, ok: !r.error && !r.port_conflict, error: r.error, port_conflict: r.port_conflict,
+                   url: r.app_url, role: p.role, starting: !!r.starting });
+  }
+  await loadProjects();
+  showGroupResult('Miscelaneo', { results, urls: results.filter(r => r.ok && r.url).map(r => ({ name: r.name, url: r.url, role: r.role, starting: !!r.starting })) });
+}
+
+async function stopMisc(key) {
+  toast(`Bajando 'Miscelaneo'…`, 'ok', 2500);
+  let failed = 0;
+  for (const p of miscProjects(key).reverse()) {
+    const r = await fetchAPI('POST', `/api/projects/${encodeURIComponent(p.name)}/down`);
+    if (r.error) failed++;
+  }
+  await loadProjects();
+  toast(failed ? `'Miscelaneo' bajado con ${failed} error(es)` : `'Miscelaneo' bajado`, failed ? 'error' : 'ok', 3000);
+}
+
+async function restartMisc(key) {
+  await stopMisc(key);
+  await startMisc(key);
+}
+
+async function removeMisc(key) {
+  const ps = miscProjects(key);
+  if (!confirm(`Eliminar del gestor: ${ps.map(p => p.name).join(', ')}?
+(Si es una ruta tuya, no se borra nada del disco)`)) return;
+  for (const p of ps) await fetchAPI('DELETE', `/api/projects/${encodeURIComponent(p.name)}`);
+  await loadProjects();
+}
+
 // ── Grupos (mono-repo: backend/frontend separados) ────────────────────────
 async function startGroup(group) {
   toast(`Levantando '${group}'…`, 'ok', 2500);
@@ -1260,8 +1320,33 @@ async function restartGroup(group) {
   showGroupResult(group, data);
 }
 
-function showGroupResult(group, data) {
-  const urls   = data.urls || [];
+// La ventana de resultado sale recién cuando lo arrancado terminó de
+// arrancar: espera a que ningún servicio del resultado siga en STARTING
+// (el vigilante del backend los pasa a RUNNING o ERROR). Mientras, la tabla
+// ya los muestra en amarillo.
+async function showGroupResult(group, data) {
+  let urls = data.urls || [];
+  const waiting = urls.filter(u => u.starting).map(u => u.name);
+  if (waiting.length) {
+    toast(`'${group}': esperando a que ${waiting.length} servicio(s) respondan…`, 'ok', 4000);
+    const t0 = Date.now();
+    while (Date.now() - t0 < 6 * 60 * 1000) {
+      await new Promise(r => setTimeout(r, 2000));
+      await loadProjects();
+      const still = state.projects.filter(p => waiting.includes(p.name) && p.status === 'STARTING');
+      if (!still.length) break;
+    }
+    const byName = Object.fromEntries(state.projects.map(p => [p.name, p]));
+    const extraFailed = [];
+    urls = urls.filter(u => {
+      const st = (byName[u.name] || {}).status;
+      if (!u.starting || st === 'RUNNING') return true;
+      extraFailed.push({ name: u.name, ok: false,
+        error: st === 'STARTING' ? 'sigue arrancando (revisá su log)' : 'no llegó a responder (revisá su log)' });
+      return false;
+    }).map(u => ({ ...u, starting: false }));
+    data = { ...data, results: [...(data.results || []), ...extraFailed] };
+  }
   const failed = (data.results || []).filter(r => !r.ok);
   const box = document.getElementById('modal-group-box');
   box.innerHTML = `
@@ -1274,7 +1359,7 @@ function showGroupResult(group, data) {
             <span>${esc(u.name)} <span style="color:var(--muted);font-weight:400">(${esc(u.role || '—')})</span></span>
             <span>${esc(u.url)}</span>
           </a>`).join('')}
-      </div>` : `<p style="color:var(--muted);font-size:13px;margin-bottom:${failed.length ? '16px' : '0'}">Ningún servicio quedó escuchando en su puerto.</p>`}
+      </div>` : `<p style="color:var(--muted);font-size:13px;margin-bottom:${failed.length ? '16px' : '0'}">Ningún servicio quedó arrancado (revisá el log de cada uno).</p>`}
     ${failed.length ? `
       <p style="color:var(--error);font-size:12px;margin-bottom:6px"><strong>Fallaron:</strong></p>
       <ul style="margin:0;padding-left:18px;color:var(--muted);font-size:12px;line-height:1.6">
